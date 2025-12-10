@@ -1,0 +1,528 @@
+#include <TB6612_ESP32.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <Arduino_JSON.h>
+#include <Adafruit_NeoPixel.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+#define PIN_NEO_PIXEL  16 
+#define NUM_PIXELS     16 
+
+// RFID pins
+#define SS_PIN 32
+#define RST_PIN 35
+
+// RGB LED pins
+#define LED_RED 4
+#define LED_GREEN 5
+#define LED_BLUE 18
+
+Adafruit_NeoPixel NeoPixel(NUM_PIXELS, PIN_NEO_PIXEL, NEO_GRB + NEO_KHZ800);
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+#define AIN1 13
+#define BIN1 12
+#define AIN2 14
+#define BIN2 27
+#define PWMA 26
+#define PWMB 25
+#define STBY 33
+
+const char* ssid = "A55luboeslovo";
+const char* password = "luboeslovo";
+
+#define RELAY_PIN 15
+
+int speed = 255;
+int direction = 0;
+int slider = 0;
+int fire = 0;
+int led = 0;
+
+// LED таймер
+unsigned long ledStartTime = 0;
+bool ledActive = false;
+bool motorActive = false;
+byte lastDetectedUID[4];
+bool cardRead = false;
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+JSONVar readings;
+
+const int offsetA = 1;
+const int offsetB = 1;
+
+Motor motor1 = Motor(AIN1, AIN2, PWMA, offsetA, STBY, 5000, 8, 1);
+Motor motor2 = Motor(BIN1, BIN2, PWMB, offsetB, STBY, 5000, 8, 2);
+
+// RFID UID массивы
+byte forwardUIDs[][4] = {
+  {0x4F, 0x0D, 0x78, 0x29},
+};
+int numForwardUIDs = sizeof(forwardUIDs) / sizeof(forwardUIDs[0]);
+
+byte leftTurnUIDs[][4] = {
+  {0xD6, 0x35, 0x26, 0x71},
+  {0x34, 0xD9, 0x64, 0x69},
+};
+int numLeftTurnUIDs = sizeof(leftTurnUIDs) / sizeof(leftTurnUIDs[0]);
+
+byte rightTurnUIDs[][4] = {
+  {0x04, 0x3C, 0xD9, 0xCA},
+};
+int numRightTurnUIDs = sizeof(rightTurnUIDs) / sizeof(rightTurnUIDs[0]);
+
+byte ledUIDs[][4] = {
+  {0x0D, 0xC9, 0x97, 0xD7},
+  {0xC7, 0x1C, 0x80, 0x73},
+};
+int numLedUIDs = sizeof(ledUIDs) / sizeof(ledUIDs[0]);
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+    body {height: 100vh;overflow: hidden;margin: 0;}
+    .parent {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        grid-template-rows: repeat(2, 1fr);
+        grid-column-gap: 0px;
+        grid-row-gap: 0px;
+        height: 100%;
+        }
+        
+        .div1 { grid-area: 1 / 2 / 3 / 3; height: 100vh;}
+        .div2 { grid-area: 1 / 1 / 2 / 2; padding: 0.5rem;}
+        .div3 { grid-area: 2 / 1 / 3 / 2; }
+        .parent-j {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        grid-template-rows: repeat(3, 1fr);
+        grid-column-gap: 0px;
+        grid-row-gap: 0px;
+        height: 100%;
+        }
+
+        .div-u { grid-area: 1 / 2 / 2 / 3; border: 1px solid gray;padding:2rem 3rem; border-radius:100% 100% 0 0;}
+        .div-l { grid-area: 2 / 1 / 3 / 2; border: 1px solid gray;padding:2.95rem 2.4rem; border-radius:100% 0 0 100%;}
+        .div-d { grid-area: 3 / 2 / 4 / 3; border: 1px solid gray;padding:2rem 3rem; border-radius:0 0 100% 100%;}
+        .div-r { grid-area: 2 / 3 / 3 / 4; border: 1px solid gray;padding:2.95rem 2.4rem; border-radius:0 100% 100% 0;}
+        .div-s { grid-area: 2 / 2 / 3 / 3; border: 1px solid rgb(233, 80, 80);padding:3rem 2.3rem; }
+
+        .analog {border:1px solid rgb(216, 211, 211);display: flex;border-radius:15px;justify-content: space-between;align-items: stretch;}
+        .analog-value{font-size:5rem;}
+        .btn-set{width: 35%;border-radius:0 10px 10px 0;border:none;background:#524FF0;color:white;font-size:1.3rem}
+        .analog-data{display: flex;flex-wrap: wrap;align-content: stretch;justify-content: flex-start;padding: 0.5rem;}
+        .div-slider{width:100%;}
+        .slider{width: 90%;}
+        .circ-btn{border-radius:100%;border:1px solid red;width:180px;height:180px;background:none;}
+        @media screen and (orientation: portrait) {
+            .parent {
+                display: grid;
+                grid-template-columns: 1fr;
+                grid-template-rows: repeat(3, 1fr);
+                grid-column-gap: 0px;
+                grid-row-gap: 0px;
+                }
+
+                .div1 { grid-area: 3 / 1 / 4 / 2; height: auto;}
+                .div2 { grid-area: 2 / 1 / 3 / 2; }
+                .div3 { grid-area: 1 / 1 / 2 / 2; }
+        }
+</style>
+<div class="parent">
+    <div class="div1">
+        <div class="parent-j">
+            <button class="div-u" id="btn-up">F</button>
+            <button class="div-l" id="btn-lt">L</button>
+            <button class="div-d" id="btn-dn">B</button>
+            <button class="div-r" id="btn-rt">R</button>
+            <button class="div-s" id="btn-sp">STOP</button>
+        </div>
+    </div>
+    <div class="div2">
+        <div class="analog">
+            <div class="analog-data"><div class="analog-value" id="slider-txt">0</div>
+                <div class="div-slider"><input id="slider-val" class="slider" type="range" value="0" min="0" max="255"/></div>
+            </div> 
+            <button class="btn-set" id="btn-set">SET</button>
+        </div>
+    </div>
+    <div class="div3"><button class="circ-btn" id="btn-fire">RELAY</button><button class="circ-btn" id="btn-led">LED</button></div>
+</div>
+
+<script>
+let gateway = `ws://${window.location.hostname}/ws`;
+
+let sliderTxt = document.querySelector("#slider-txt");
+let sliderVal = document.querySelector("#slider-val");
+let fireBtn = document.querySelector("#btn-fire");
+let ledBtn = document.querySelector("#btn-led");
+let ledState = 0;
+let fireState = 0;
+
+let websocket;
+window.addEventListener('load', onload);
+
+function onload(event) {
+    initWebSocket();
+    initButtons();
+}
+
+function initButtons() {
+  document.querySelector('#btn-up').addEventListener('touchstart', ()=>{ websocket.send(JSON.stringify({dir:11})) });
+  document.querySelector('#btn-up').addEventListener('touchend', ()=>{ websocket.send(JSON.stringify({dir:12})) });
+
+  document.querySelector('#btn-dn').addEventListener('touchstart', ()=>{ websocket.send(JSON.stringify({dir:21})) });
+  document.querySelector('#btn-dn').addEventListener('touchend', ()=>{ websocket.send(JSON.stringify({dir:22})) });
+
+  document.querySelector('#btn-lt').addEventListener('touchstart', ()=>{ websocket.send(JSON.stringify({dir:31})) });
+  document.querySelector('#btn-lt').addEventListener('touchend', ()=>{ websocket.send(JSON.stringify({dir:32})) });
+
+  document.querySelector('#btn-rt').addEventListener('touchstart', ()=>{ websocket.send(JSON.stringify({dir:41})) });
+  document.querySelector('#btn-rt').addEventListener('touchend', ()=>{ websocket.send(JSON.stringify({dir:42})) });
+
+  document.querySelector('#btn-set').addEventListener('click', ()=>{ websocket.send(JSON.stringify({slider: parseInt(sliderVal.value)})) });
+  document.querySelector('#btn-led').addEventListener('click', ()=>{ 
+    ledState = !ledState;
+    toggleBg(ledBtn, ledState);
+    websocket.send(JSON.stringify({led:ledState ? 1 : 0})); 
+  });
+  
+  document.querySelector('#btn-fire').addEventListener('click', ()=>{ 
+    fireState = !fireState;
+    toggleBg(fireBtn, fireState);
+    websocket.send(JSON.stringify({fire:fireState ? 1 : 0})); 
+  });
+
+  document.querySelector('#slider-val').addEventListener('change', ()=>{
+    document.querySelector("#slider-txt").innerHTML = sliderVal.value;
+  });
+}
+
+function toggleBg(btn, state) {
+    if (state) {
+        btn.style.background = '#ff0000';
+    }
+    else {
+        btn.style.background = '#ffffff';
+    }
+}
+
+function initWebSocket() {
+    console.log('Trying to open a WebSocket connection…');
+    websocket = new WebSocket(gateway);
+    websocket.onopen = onOpen;
+    websocket.onclose = onClose;
+    websocket.onmessage = onMessage;
+}
+
+function onOpen(event) {
+    console.log('Connection opened');
+    getReadings();
+}
+
+function onClose(event) {
+    console.log('Connection closed');
+    setTimeout(initWebSocket, 2000);
+}
+
+function getReadings(){
+    websocket.send("getReadings");
+}
+
+function onMessage(event) {
+    websocket.send("getReadings");
+}
+</script>
+)rawliteral";
+
+String getSensorReadings(){
+  readings["s"] = String(slider);
+  String jsonString = JSON.stringify(readings);
+  return jsonString;
+}
+
+void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi ..");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print('.');
+    delay(1000);
+  }
+  Serial.println(WiFi.localIP());
+}
+
+void notifyClients(String sensorReadings) {
+  ws.textAll(sensorReadings);
+}
+
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
+  AwsFrameInfo *info = (AwsFrameInfo*)arg;
+  if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+    
+    JSONVar myObject = JSON.parse((const char*)data);
+    if (myObject.hasOwnProperty("slider")) {
+      slider = (int)myObject["slider"];
+    }
+    else if (myObject.hasOwnProperty("fire")) {
+      fire = (int)myObject["fire"];      
+    }
+    else if (myObject.hasOwnProperty("led")) {
+      led = (int)myObject["led"];      
+    }
+    else if (myObject.hasOwnProperty("dir")) {
+      direction = (int)myObject["dir"];
+      move(direction, speed);      
+    }
+
+    String sensorReadings = getSensorReadings();
+    notifyClients(sensorReadings);
+  }
+}
+
+void move(int direction, int speed) {
+  if (direction == 11) {
+    forward(motor1, motor2, speed);
+  }
+  else if (direction == 12) {
+    motor1.brake();
+    motor2.brake();
+  }
+  else if (direction == 21) {
+    back(motor1, motor2, speed);
+  }
+  else if (direction == 22) {
+    motor1.brake();
+    motor2.brake();
+  }
+  else if (direction == 31) {
+    motor1.drive(-255);
+    motor2.drive(255);
+  }
+  else if (direction == 32) {
+    motor1.brake();
+    motor2.brake();
+  }
+  else if (direction == 41) {
+    motor1.drive(255);
+    motor2.drive(-255);
+  }
+  else if (direction == 42) {
+    motor1.brake();
+    motor2.brake();
+  }
+}
+
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  switch (type) {
+    case WS_EVT_CONNECT:
+      Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+      break;
+    case WS_EVT_DISCONNECT:
+      Serial.printf("WebSocket client #%u disconnected\n", client->id());
+      break;
+    case WS_EVT_DATA:
+      handleWebSocketMessage(arg, data, len);
+      break;
+    case WS_EVT_PONG:
+    case WS_EVT_ERROR:
+      break;
+  }
+}
+
+void initWebSocket() {
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+}
+
+// RFID функции
+bool checkUIDInForwardArray(byte *uid, byte uidSize) {
+  for (int i = 0; i < numForwardUIDs; i++) {
+    bool match = true;
+    if (uidSize != 4) continue;
+    for (byte j = 0; j < uidSize; j++) {
+      if (uid[j] != forwardUIDs[i][j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+bool checkUIDInLeftTurnArray(byte *uid, byte uidSize) {
+  for (int i = 0; i < numLeftTurnUIDs; i++) {
+    bool match = true;
+    if (uidSize != 4) continue;
+    for (byte j = 0; j < uidSize; j++) {
+      if (uid[j] != leftTurnUIDs[i][j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+bool checkUIDInRightTurnArray(byte *uid, byte uidSize) {
+  for (int i = 0; i < numRightTurnUIDs; i++) {
+    bool match = true;
+    if (uidSize != 4) continue;
+    for (byte j = 0; j < uidSize; j++) {
+      if (uid[j] != rightTurnUIDs[i][j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+bool checkUIDInLedArray(byte *uid, byte uidSize) {
+  for (int i = 0; i < numLedUIDs; i++) {
+    bool match = true;
+    if (uidSize != 4) continue;
+    for (byte j = 0; j < uidSize; j++) {
+      if (uid[j] != ledUIDs[i][j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+void setRGBColor(int red, int green, int blue) {
+  analogWrite(LED_RED, red);
+  analogWrite(LED_GREEN, green);
+  analogWrite(LED_BLUE, blue);
+}
+
+void executeAction(byte *uid) {
+  if (checkUIDInForwardArray(uid, 4)) {
+    Serial.println("Действие: Еду вперед...");
+    forward(motor1, motor2, 255);
+    motorActive = true;
+  }
+  else if (checkUIDInLeftTurnArray(uid, 4)) {
+    Serial.println("Действие: Поворот налево + вперед...");
+    motor1.drive(-255);
+    motor2.drive(255);
+    delay(1000);
+    forward(motor1, motor2, 255);
+    motorActive = true;
+  }
+  else if (checkUIDInRightTurnArray(uid, 4)) {
+    Serial.println("Действие: Поворот направо + вперед...");
+    motor1.drive(255);
+    motor2.drive(-255);
+    delay(1000);
+    forward(motor1, motor2, 255);
+    motorActive = true;
+  }
+  else if (checkUIDInLedArray(uid, 4)) {
+    Serial.println("Действие: Включаю RGB LED...");
+    setRGBColor(255, 0, 0);  // Красный цвет
+    ledActive = true;
+    ledStartTime = millis();
+  }
+}
+
+void checkRFID() {
+  if (!mfrc522.PICC_IsNewCardPresent()) return;
+  if (!mfrc522.PICC_ReadCardSerial()) return;
+
+  Serial.print("UID карты: ");
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
+    Serial.print(mfrc522.uid.uidByte[i], HEX);
+  }
+  Serial.println();
+
+  for (int i = 0; i < 4; i++) {
+    lastDetectedUID[i] = mfrc522.uid.uidByte[i];
+  }
+  cardRead = true;
+
+  if (motorActive) {
+    Serial.println("Остановка!");
+    motor1.brake();
+    motor2.brake();
+    motorActive = false;
+    delay(500);
+    executeAction(lastDetectedUID);
+  } 
+  else {
+    executeAction(lastDetectedUID);
+  }
+
+  mfrc522.PICC_HaltA();
+}
+
+void setup()
+{
+  NeoPixel.begin(); 
+  Serial.begin(115200);
+  delay(1000);
+  
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  
+  setRGBColor(0, 0, 0);  // Выключить RGB LED
+
+  SPI.begin(18, 19, 17, 32);
+  delay(100);
+  mfrc522.PCD_Init();
+  Serial.println("RFID готов к работе...");
+
+  initWiFi();
+  initWebSocket();
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", index_html);
+  });
+  server.begin();
+}
+
+void loop()
+{
+  checkRFID();
+  
+  if (ledActive) {
+    if (millis() - ledStartTime >= 2000) {
+      setRGBColor(0, 0, 0);  // Выключить RGB LED
+      Serial.println("LED выключен");
+      ledActive = false;
+    }
+  }
+  
+  if (ledActive) {
+    for (int pixel = 0; pixel < NUM_PIXELS; pixel++) {          
+      NeoPixel.setPixelColor(pixel, NeoPixel.Color(255, 255, 255));
+    }
+    NeoPixel.show();
+  }
+  else {
+    NeoPixel.clear();
+    NeoPixel.show();
+  }
+
+  if (fire == 1) {
+    digitalWrite(RELAY_PIN, HIGH);
+  }
+  else {
+    digitalWrite(RELAY_PIN, LOW);
+  }
+}
